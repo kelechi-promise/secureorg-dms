@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SecureOrg DMS</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light;--bg:#f4f6f9;--card:#fff;--tx:#1b2430;--mu:#667085;--ac:#0b5fff;--bd:#d9dee7;--bad:#c62828;--ok:#1b7f3b}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#10151c;--card:#19212b;--tx:#e8edf3;--mu:#97a3b3;--ac:#5b9bff;--bd:#2c3745;--bad:#ff7b72;--ok:#4ac26b}}
+:root[data-theme="dark"]{color-scheme:dark;--bg:#10151c;--card:#19212b;--tx:#e8edf3;--mu:#97a3b3;--ac:#5b9bff;--bd:#2c3745;--bad:#ff7b72;--ok:#4ac26b}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:960px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:14px}
+h1{font-size:20px;margin:0}h2{font-size:16px;margin:0 0 10px}
+.top{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.mu{color:var(--mu);font-size:13px}
+input,select,textarea,button{font:inherit;color:var(--tx);background:var(--bg);border:1px solid var(--bd);border-radius:7px;padding:8px 10px;width:100%}
+textarea{min-height:80px}
+button{width:auto;cursor:pointer;background:var(--ac);color:#fff;border-color:var(--ac)}
+button.g{background:transparent;color:var(--tx);border-color:var(--bd)}
+button.d{background:transparent;color:var(--bad);border-color:var(--bad)}
+button.on{outline:2px solid var(--ac)}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:10px}
+label{font-size:13px;color:var(--mu);display:block;margin-bottom:3px}
+.sc{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:7px 8px;border-bottom:1px solid var(--bd);vertical-align:top}
+.b{display:inline-block;font-size:12px;padding:1px 8px;border-radius:99px;border:1px solid var(--bd)}
+.nav{display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+#t{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(16px + env(safe-area-inset-bottom,0px));background:var(--tx);color:var(--bg);padding:9px 16px;border-radius:8px;display:none;max-width:90%;z-index:9}
+pre{white-space:pre-wrap;word-break:break-word;margin:0;font:inherit}
+.hash{font:11px ui-monospace,Menlo,monospace;color:var(--mu)}
+details{font-size:13px;color:var(--mu)}
+</style></head><body>
+<div class="wrap" id="app"></div><div id="t"></div>
+<script>
+const enc=new TextEncoder(),dec=new TextDecoder(),$=s=>document.querySelector(s);
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b))),ub=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const rand=n=>crypto.getRandomValues(new Uint8Array(n));
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let DB,S=null,okey=null,orgRaw=null,tab='rec',editing=null,viewing=null,idle=null,q='';
+const IDLE_MS=5*60*1000,MAX_FAILS=3,LOCK_MS=30000;
+
+function load(){try{DB=JSON.parse(localStorage.getItem('sodms'))}catch(e){}DB=DB||{users:[],records:[],audit:[]}}
+function save(){try{localStorage.setItem('sodms',JSON.stringify(DB))}catch(e){toast('Storage unavailable')}}
+function toast(m){const t=$('#t');t.textContent=m;t.style.display='block';clearTimeout(t.h);t.h=setTimeout(()=>t.style.display='none',3200)}
+
+// ---- crypto ----
+async function kd(pw,salt){const k=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveBits']);return crypto.subtle.deriveBits({name:'PBKDF2',hash:'SHA-256',salt:ub(salt),iterations:150000},k,256)}
+async function wkey(pw,salt){return crypto.subtle.importKey('raw',await kd(pw,salt),'AES-GCM',false,['encrypt','decrypt'])}
+async function sha(s){return b64(await crypto.subtle.digest('SHA-256',enc.encode(s)))}
+async function mkUser(name,un,pw,role,raw){
+  const s1=b64(rand(16)),s2=b64(rand(16)),iv=rand(12);
+  const ct=await crypto.subtle.encrypt({name:'AES-GCM',iv},await wkey(pw,s2),raw);
+  return{name,un,role,s1,s2,h:b64(await kd(pw,s1)),wk:b64(iv)+'.'+b64(ct),fails:0,lock:0}}
+async function setKey(raw){orgRaw=raw;okey=await crypto.subtle.importKey('raw',raw,'AES-GCM',false,['encrypt','decrypt'])}
+const strong=p=>p.length>=8&&/[a-z]/.test(p)&&/[A-Z]/.test(p)&&/\d/.test(p);
+
+// ---- audit (hash-chained) ----
+async function log(a,d=''){
+  const prev=DB.audit.length?DB.audit[DB.audit.length-1].h:'0';
+  const e={t:new Date().toISOString(),u:S?S.un:'-',a,d,prev};
+  e.h=await sha(JSON.stringify([e.t,e.u,e.a,e.d,e.prev]));DB.audit.push(e);save()}
+async function verifyChain(){
+  let prev='0';
+  for(const e of DB.audit){if(e.prev!==prev||e.h!==await sha(JSON.stringify([e.t,e.u,e.a,e.d,e.prev])))return false;prev=e.h}
+  return true}
+
+// ---- auth ----
+async function setup(){
+  const name=$('#n').value.trim(),un=$('#u').value.trim().toLowerCase(),pw=$('#p').value;
+  if(!name||!un)return toast('Fill in all fields');
+  if(!strong(pw))return toast('Password: 8+ chars with upper, lower and a digit');
+  await setKey(rand(32));DB.users.push(await mkUser(name,un,pw,'Admin',orgRaw));
+  S=null;await log('SETUP','Administrator account created');okey=orgRaw=null;toast('Administrator created. Please log in.');render()}
+async function login(){
+  const un=$('#u').value.trim().toLowerCase(),pw=$('#p').value,u=DB.users.find(x=>x.un===un);
+  if(!u){await log('LOGIN_FAIL','unknown user '+un);return toast('Invalid credentials')}
+  if(u.lock>Date.now())return toast('Account locked. Try again in '+Math.ceil((u.lock-Date.now())/1000)+'s');
+  if(b64(await kd(pw,u.s1))!==u.h){
+    u.fails++;if(u.fails>=MAX_FAILS){u.lock=Date.now()+LOCK_MS;u.fails=0;await log('LOCKOUT',un)}
+    S=null;await log('LOGIN_FAIL',un);save();return toast('Invalid credentials')}
+  const[i,c]=u.wk.split('.');
+  await setKey(new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub(i)},await wkey(pw,u.s2),ub(c))));
+  u.fails=0;u.lock=0;S=u;await log('LOGIN','ok');tab='rec';bump();render()}
+async function logout(why){if(S)await log('LOGOUT',why||'user');S=okey=orgRaw=null;editing=viewing=null;clearTimeout(idle);render();if(why)toast('Logged out: '+why)}
+function bump(){clearTimeout(idle);if(S)idle=setTimeout(()=>logout('session timeout'),IDLE_MS)}
+['click','keydown'].forEach(ev=>addEventListener(ev,bump));
+
+// ---- access control ----
+const priv=()=>S.role==='Admin'||S.role==='Manager';
+const canSee=r=>priv()||r.cls!=='Confidential'||r.owner===S.un;
+const canEdit=r=>priv()||r.owner===S.un;
+
+// ---- records ----
+async function saveRec(){
+  const title=$('#rt').value.trim(),dept=$('#rd').value.trim(),cls=$('#rc').value,body=$('#rb').value;
+  if(!title||!body)return toast('Title and content are required');
+  const iv=rand(12),ct=b64(await crypto.subtle.encrypt({name:'AES-GCM',iv},okey,enc.encode(body)));
+  if(editing){const r=DB.records.find(x=>x.id===editing);if(!r||!canEdit(r))return toast('Access denied');
+    Object.assign(r,{title,dept,cls,iv:b64(iv),ct,t:new Date().toISOString()});await log('UPDATE_RECORD',title)}
+  else{DB.records.push({id:crypto.randomUUID(),title,dept,cls,owner:S.un,t:new Date().toISOString(),iv:b64(iv),ct});await log('CREATE_RECORD',title)}
+  editing=null;save();render();toast('Record saved (encrypted)')}
+async function openRec(id,mode){
+  const r=DB.records.find(x=>x.id===id);if(!r||!canSee(r))return toast('Access denied');
+  try{const p=dec.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:ub(r.iv)},okey,ub(r.ct)));
+    if(mode==='edit'){if(!canEdit(r))return toast('Access denied');editing=id;render();
+      $('#rt').value=r.title;$('#rd').value=r.dept;$('#rc').value=r.cls;$('#rb').value=p;scrollTo(0,0)}
+    else{viewing={r,p};await log('VIEW_RECORD',r.title);render()}}
+  catch(e){toast('Decryption failed: data tampered or wrong key')}}
+async function delRec(id){
+  const r=DB.records.find(x=>x.id===id);if(!r||!canEdit(r))return toast('Access denied');
+  if(!confirm('Delete "'+r.title+'"?'))return;
+  DB.records=DB.records.filter(x=>x.id!==id);await log('DELETE_RECORD',r.title);save();viewing=null;render()}
+
+// ---- users (admin) ----
+async function addUser(){
+  if(S.role!=='Admin')return;
+  const name=$('#xn').value.trim(),un=$('#xu').value.trim().toLowerCase(),pw=$('#xp').value,role=$('#xr').value;
+  if(!name||!un)return toast('Fill in all fields');
+  if(DB.users.some(x=>x.un===un))return toast('Username already exists');
+  if(!strong(pw))return toast('Password: 8+ chars with upper, lower and a digit');
+  DB.users.push(await mkUser(name,un,pw,role,orgRaw));await log('CREATE_USER',un+' as '+role);save();render();toast('User created')}
+async function setRole(un,role){const u=DB.users.find(x=>x.un===un);if(S.role!=='Admin'||!u||u.un===S.un)return;u.role=role;await log('CHANGE_ROLE',un+' → '+role);save();render()}
+async function delUser(un){if(S.role!=='Admin'||un===S.un||!confirm('Delete user '+un+'?'))return;DB.users=DB.users.filter(x=>x.un!==un);await log('DELETE_USER',un);save();render()}
+async function unlock(un){const u=DB.users.find(x=>x.un===un);u.lock=0;u.fails=0;await log('UNLOCK',un);save();render()}
+async function verify(){toast(await verifyChain()?'Audit log integrity: VALID':'Audit log integrity: TAMPERED')}
+function backup(){const a=document.createElement('a');a.href='data:application/json,'+encodeURIComponent(JSON.stringify(DB));a.download='secureorg-backup.json';a.click();log('BACKUP','export')}
+
+// ---- views ----
+function go(t){tab=t;viewing=null;render()}
+function render(){
+  const app=$('#app');
+  if(!DB.users.length||!S){
+    const first=!DB.users.length;
+    app.innerHTML=`<div class="top"><h1>SecureOrg DMS</h1></div><div class="card" style="max-width:420px;margin:0 auto">
+    <h2>${first?'First-time setup: create administrator':'Sign in'}</h2>
+    ${first?'<label>Full name</label><input id="n" autocomplete="off"><br>':''}
+    <label>Username</label><input id="u" autocomplete="off" style="margin-bottom:10px">
+    <label>Password</label><input id="p" type="password" style="margin-bottom:12px">
+    <button onclick="${first?'setup()':'login()'}">${first?'Create administrator':'Sign in'}</button>
+    <p class="mu">Passwords are salted and hashed with PBKDF2. Three failed attempts lock the account for 30 seconds.</p></div>
+    <details style="max-width:420px;margin:0 auto"><summary>Security features</summary>Salted PBKDF2-SHA256 password hashing (150,000 rounds) · AES-256-GCM encryption of all record content · per-user key wrapping · role-based access control · hash-chained tamper-evident audit log · account lockout · 5-minute inactivity logout · output escaping against XSS.</details>`;
+    return}
+  const vis=DB.records.filter(canSee).filter(r=>(r.title+r.dept).toLowerCase().includes(q.toLowerCase()));
+  let h=`<div class="top"><div><h1>SecureOrg DMS</h1><span class="mu">${esc(S.name)} <span class="b">${S.role}</span></span></div><button class="g" onclick="logout()">Log out</button></div>
+  <div class="nav"><button class="${tab==='rec'?'':'g'}" onclick="go('rec')">Records</button>
+  ${S.role==='Admin'?`<button class="${tab==='usr'?'':'g'}" onclick="go('usr')">Users</button><button class="${tab==='aud'?'':'g'}" onclick="go('aud')">Audit log</button>`:''}</div>`;
+  if(tab==='rec'){
+    h+=`<div class="card"><h2>${editing?'Edit record':'New record'}</h2><div class="row">
+    <div><label>Title</label><input id="rt"></div><div><label>Department</label><input id="rd"></div>
+    <div><label>Classification</label><select id="rc"><option>Public</option><option selected>Internal</option><option>Confidential</option></select></div></div>
+    <label>Content (encrypted at rest)</label><textarea id="rb"></textarea><br><br>
+    <button onclick="saveRec()">${editing?'Update':'Save'} record</button>${editing?' <button class="g" onclick="editing=null;render()">Cancel</button>':''}</div>`;
+    if(viewing)h+=`<div class="card"><h2>${esc(viewing.r.title)} <span class="b">${viewing.r.cls}</span></h2><pre>${esc(viewing.p)}</pre><br><button class="g" onclick="viewing=null;render()">Close</button></div>`;
+    h+=`<div class="card"><h2>Records (${vis.length})</h2><input placeholder="Search title or department" value="${esc(q)}" oninput="q=this.value;render();$('#s')&&0" id="s" style="margin-bottom:10px"><div class="sc"><table><tr><th>Title</th><th>Dept</th><th>Class</th><th>Owner</th><th>Updated</th><th></th></tr>
+    ${vis.map(r=>`<tr><td>${esc(r.title)}</td><td>${esc(r.dept)}</td><td><span class="b">${r.cls}</span></td><td>${esc(r.owner)}</td><td>${new Date(r.t).toLocaleString()}</td>
+    <td style="white-space:nowrap"><button class="g" onclick="openRec('${r.id}')">View</button> ${canEdit(r)?`<button class="g" onclick="openRec('${r.id}','edit')">Edit</button> <button class="d" onclick="delRec('${r.id}')">Delete</button>`:''}</td></tr>`).join('')||'<tr><td colspan="6" class="mu">No records yet.</td></tr>'}</table></div></div>`}
+  if(tab==='usr'&&S.role==='Admin'){
+    h+=`<div class="card"><h2>Add user</h2><div class="row"><div><label>Full name</label><input id="xn"></div><div><label>Username</label><input id="xu"></div>
+    <div><label>Initial password</label><input id="xp" type="password"></div><div><label>Role</label><select id="xr"><option>Staff</option><option>Manager</option><option>Admin</option></select></div></div>
+    <button onclick="addUser()">Create user</button></div>
+    <div class="card"><h2>Users</h2><div class="sc"><table><tr><th>Name</th><th>Username</th><th>Role</th><th>Status</th><th></th></tr>
+    ${DB.users.map(u=>`<tr><td>${esc(u.name)}</td><td>${esc(u.un)}</td><td>${u.un===S.un?u.role:`<select onchange="setRole('${esc(u.un)}',this.value)">${['Staff','Manager','Admin'].map(r=>`<option ${r===u.role?'selected':''}>${r}</option>`).join('')}</select>`}</td>
+    <td>${u.lock>Date.now()?'<span style="color:var(--bad)">Locked</span>':'Active'}</td><td>${u.un!==S.un?`${u.lock>Date.now()?`<button class="g" onclick="unlock('${esc(u.un)}')">Unlock</button> `:''}<button class="d" onclick="delUser('${esc(u.un)}')">Delete</button>`:''}</td></tr>`).join('')}</table></div></div>`}
+  if(tab==='aud'&&S.role==='Admin'){
+    h+=`<div class="card"><h2>Audit log (${DB.audit.length})</h2><button onclick="verify()">Verify integrity</button> <button class="g" onclick="backup()">Export backup</button><br><br><div class="sc"><table><tr><th>Time</th><th>User</th><th>Action</th><th>Detail</th><th>Hash</th></tr>
+    ${DB.audit.slice().reverse().slice(0,200).map(e=>`<tr><td>${new Date(e.t).toLocaleString()}</td><td>${esc(e.u)}</td><td>${esc(e.a)}</td><td>${esc(e.d)}</td><td class="hash">${esc(e.h.slice(0,10))}…</td></tr>`).join('')}</table></div></div>`}
+  const fo=document.activeElement&&document.activeElement.id==='s';
+  app.innerHTML=h;if(fo){const s=$('#s');s.focus();s.setSelectionRange(q.length,q.length)}}
+load();render();
+</script></body></html>
